@@ -1066,6 +1066,7 @@ class QwenGRPOTrainer(Trainer):
         if self.use_ssr_buffer and self.accelerator.process_index == 0:
             # if the average absolute advantage is greater than 0, we add that example to the buffer with the average advantage
             average_abs_advantage = torch.abs(advantages).mean().item()
+            self._metrics["avg_abs_advantage"].append(average_abs_advantage)
             if average_abs_advantage > 0:
                 print(f"Adding {inputs[0]} to the SSR buffer with advantage {average_abs_advantage}")
 
@@ -1187,8 +1188,11 @@ class QwenGRPOTrainer(Trainer):
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
         # Log the metrics
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        completion_lengths_tensor = self.accelerator.gather_for_metrics(completion_mask.sum(1))
+        completion_length = completion_lengths_tensor.float().mean().item()
         self._metrics["completion_length"].append(completion_length)
+        max_completion_length = completion_lengths_tensor.float().max().item()
+        self._metrics["max_completion_length"].append(max_completion_length)
 
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
