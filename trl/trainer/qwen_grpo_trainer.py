@@ -652,6 +652,45 @@ class QwenGRPOTrainer(Trainer):
             vlm_model = self.vlm.llm_engine.model_executor.driver_worker.model_runner.model
             vlm_model.load_weights(state_dict.items())
 
+    def _sync_inputs_across_processes(self, inputs_on_main_process: Optional[Any]) -> Any:
+        """
+        Synchronizes input data from the main process to all other processes.
+
+        Args:
+            inputs_on_main_process: The data structure (e.g., dict, list) held by the main process.
+                                    Other processes should pass None or an empty placeholder.
+
+        Returns:
+            A deep copy of the synchronized data, identical on all processes.
+        """
+        if self.accelerator.num_processes <= 1:
+            # No synchronization needed for single process
+            # Return a deepcopy to ensure consistency with the multi-process case output
+            return deepcopy(inputs_on_main_process)
+
+        # Use broadcast_object_list for efficiency: main process sends, others receive.
+        if self.accelerator.is_main_process:
+            # Ensure the input is not None before broadcasting
+            if inputs_on_main_process is None:
+                raise ValueError("Main process provided None to _sync_inputs_across_processes")
+            objects_to_broadcast = [inputs_on_main_process]
+        else:
+            # Placeholder for non-main processes.
+            objects_to_broadcast = [None]
+
+        # Broadcast the list containing the input data from process 0
+        broadcast_object_list(objects_to_broadcast, from_process=0)
+
+        # All processes now have the data in objects_to_broadcast[0]
+        # Perform a deepcopy to prevent unintended modifications across processes
+        # if the broadcasted object contains mutable types.
+        synced_inputs = deepcopy(objects_to_broadcast[0])
+
+        # Add a barrier to ensure all processes have received the data before proceeding
+        self.accelerator.wait_for_everyone()
+
+        return synced_inputs
+
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
 
@@ -659,33 +698,21 @@ class QwenGRPOTrainer(Trainer):
 
         # compare to the inputs from the oversampling dataloader
         if self.accelerator.is_main_process:
-            i = 0
-            while True:
-                oversampling_inputs = self._get_next_oversampling_batch()
-                i += 1
-                print(i)
+            oversampling_inputs = self._get_next_oversampling_batch()
+            print(
+                f"The oversampling inputs on {device=} are {oversampling_inputs}. There are {len(oversampling_inputs)} oversampling inputs."
+            )
 
         self.accelerator.wait_for_everyone()
 
         if not self.env:
             raise ValueError("No environment provided. Only supporting envs now. ")
 
-        # TODO: This is a hack that we should probably fix.
-        # without this, each gpu receives different inputs, screwing up the advantage computation.
-        # Simple synchronization of inputs across processes
-        if self.accelerator.num_processes > 1:
-            # Make sure all processes have a non-None value to gather
-            # Use an empty list for non-main processes
-            local_inputs = inputs if self.accelerator.process_index == 0 else []
-
-            # Gather from all processes using torch.distributed.gather_object
-            all_inputs = gather_object(local_inputs)
-
-            # each process takes the inputs from process 0 as its inputs
-            inputs = deepcopy(all_inputs)
-
-        self.accelerator.wait_for_everyone()
-
+        # Determine the input for the current process before sync
+        process_input = inputs if self.accelerator.is_main_process else None
+        # Synchronize the initial input batch.
+        # 'inputs' now refers to the synchronized, identical batch on all processes.
+        inputs = self._sync_inputs_across_processes(process_input)
         # conversations: list of conversations
         # prompts_text: list of prompts as strings
         # prompt_inputs: tokenized data (with image tokens injected) that we will use to compute log probs on the base model.
@@ -888,22 +915,6 @@ class QwenGRPOTrainer(Trainer):
 
         self.accelerator.wait_for_everyone()
         print(f"Finished with waiting for everyone, {self.accelerator.process_index=}")
-
-        # # DEBUG: Verify prompt consistency across completions in each group
-        # TODO: remove this probably?
-        # if self.accelerator.is_main_process:
-        #     all_prompts = gather_object(prompts_text)
-
-        #     if not len(all_prompts) == self.num_generations:
-        #         raise ValueError(
-        #             f"We should have one prompt per generation, but we have {len(all_prompts)} prompts and {self.num_generations} generations"
-        #         )
-        #     if not len(set(all_prompts)) == 1:
-        #         raise ValueError(f"All prompts should be the same. {all_prompts=}")
-        #     print("PASSED PROMPT CONSISTENCY CHECK")
-
-        # # Add synchronization point to prevent processes from getting out of sync
-        # self.accelerator.wait_for_everyone()
 
         # Calculate current weights based on schedule/config
         current_step_weights = []
