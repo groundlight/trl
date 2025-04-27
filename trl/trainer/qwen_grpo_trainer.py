@@ -27,7 +27,7 @@ from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -508,6 +508,35 @@ class QwenGRPOTrainer(Trainer):
         self.image_pad_id = image_pad_id
         self.inputs_to_log = inputs_to_log
 
+        # Initialize the dataloader for oversampling
+        if train_dataset is not None and self.args.world_size > 0:  # Check if training is happening
+            # Create a NEW sampler for oversampling with a DIFFERENT seed
+            oversampling_seed = self.args.seed + 42  # Offset the seed
+            print(f"Initializing oversampling sampler with seed: {oversampling_seed}")
+            oversampling_sampler = RepeatRandomSampler(
+                self.train_dataset,  # Use the same dataset
+                self.num_generations,  # Use the same repeat count
+                shuffle=self.shuffle_dataset,  # Use the same shuffle setting
+                seed=oversampling_seed,  # Use the DIFFERENT seed
+            )
+
+            self.oversampling_dataloader = DataLoader(  # Keep torch.utils.data.DataLoader if that's what you had
+                self.train_dataset,
+                batch_size=self.args.per_device_train_batch_size,
+                sampler=oversampling_sampler,  # Use the new sampler instance
+                collate_fn=self.data_collator,
+                drop_last=self.args.dataloader_drop_last,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+            self.oversampling_iterator = iter(self.oversampling_dataloader)
+            print("Initialized oversampling dataloader with randomized order.")
+        else:
+            # Handle cases where there's no training dataset (e.g., evaluation only)
+            self.oversampling_dataloader = None
+            self.oversampling_iterator = None
+            print("No training dataset provided or world_size <= 0, skipping oversampling dataloader initialization.")
+
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
@@ -539,6 +568,34 @@ class QwenGRPOTrainer(Trainer):
             shuffle=self.shuffle_dataset,
             seed=self.args.seed,
         )
+
+    def _get_next_oversampling_batch(self):
+        """
+        Fetches the next batch from the oversampling dataloader.
+        Handles iterator exhaustion by resetting it.
+        Assumes this is called only on the main process.
+        """
+        if self.oversampling_iterator is None:
+            raise RuntimeError("Oversampling dataloader was not initialized.")
+
+        try:
+            num_gpus = self.accelerator.num_processes
+            # skip by the number of gpus and and get the last element from that
+            for _ in range(num_gpus - 1):
+                next(self.oversampling_iterator)
+
+            batch = next(self.oversampling_iterator)
+        except StopIteration:
+            print("Oversampling dataloader iterator exhausted, resetting.")
+            # Recreate the iterator from the dataloader
+            self.oversampling_iterator = iter(self.oversampling_dataloader)
+            try:
+                batch = next(self.oversampling_iterator)
+            except StopIteration:
+                # This should theoretically not happen if the dataset has data
+                # and the dataloader was created correctly, but handle defensively.
+                raise RuntimeError("Failed to get batch from oversampling dataloader even after reset.")
+        return batch
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(
@@ -597,6 +654,18 @@ class QwenGRPOTrainer(Trainer):
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
+
+        print(f"The inputs on {device=} are {inputs}. There are {len(inputs)} inputs.")
+
+        # compare to the inputs from the oversampling dataloader
+        if self.accelerator.is_main_process:
+            i = 0
+            while True:
+                oversampling_inputs = self._get_next_oversampling_batch()
+                i += 1
+                print(i)
+
+        self.accelerator.wait_for_everyone()
 
         if not self.env:
             raise ValueError("No environment provided. Only supporting envs now. ")
