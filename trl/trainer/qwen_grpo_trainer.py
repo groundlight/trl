@@ -691,28 +691,11 @@ class QwenGRPOTrainer(Trainer):
 
         return synced_inputs
 
-    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+    def _process_batch_for_advantages(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
 
-        print(f"The inputs on {device=} are {inputs}. There are {len(inputs)} inputs.")
-
-        # compare to the inputs from the oversampling dataloader
-        if self.accelerator.is_main_process:
-            oversampling_inputs = self._get_next_oversampling_batch()
-            print(
-                f"The oversampling inputs on {device=} are {oversampling_inputs}. There are {len(oversampling_inputs)} oversampling inputs."
-            )
-
-        self.accelerator.wait_for_everyone()
-
-        if not self.env:
-            raise ValueError("No environment provided. Only supporting envs now. ")
-
-        # Determine the input for the current process before sync
-        process_input = inputs if self.accelerator.is_main_process else None
-        # Synchronize the initial input batch.
-        # 'inputs' now refers to the synchronized, identical batch on all processes.
-        inputs = self._sync_inputs_across_processes(process_input)
         # conversations: list of conversations
         # prompts_text: list of prompts as strings
         # prompt_inputs: tokenized data (with image tokens injected) that we will use to compute log probs on the base model.
@@ -954,6 +937,61 @@ class QwenGRPOTrainer(Trainer):
         print("Finished with advantages")
 
         average_abs_advantage = torch.abs(advantages).mean().item()
+
+        out = {
+            "average_abs_advantage": average_abs_advantage,
+            "conversations": conversations,
+            "advantages": advantages,
+            "rewards_per_func": rewards_per_func,
+            "rewards": rewards,
+            "std_grouped_rewards": std_grouped_rewards,
+            "prompts_text": prompts_text,
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completions_text": completions_text,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "ref_per_token_logps": ref_per_token_logps,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+        }
+
+        return out
+
+    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        device = self.accelerator.device
+
+        if not self.env:
+            raise ValueError("No environment provided. Only supporting envs now. ")
+
+        # Determine the input for the current process before sync
+        process_input = inputs if self.accelerator.is_main_process else None
+        # Synchronize the initial input batch.
+        # 'inputs' now refers to the synchronized, identical batch on all processes.
+        inputs = self._sync_inputs_across_processes(process_input)
+
+        outputs = self._process_batch_for_advantages(inputs)
+
+        # unpack outputs
+        average_abs_advantage = outputs["average_abs_advantage"]
+        advantages = outputs["advantages"]
+
+        rewards_per_func = outputs["rewards_per_func"]
+        rewards = outputs["rewards"]
+        std_grouped_rewards = outputs["std_grouped_rewards"]
+
+        prompts_text = outputs["prompts_text"]
+        prompt_ids = outputs["prompt_ids"]
+        prompt_mask = outputs["prompt_mask"]
+        conversations = outputs["conversations"]
+        completions_text = outputs["completions_text"]
+        completion_ids = outputs["completion_ids"]
+        completion_mask = outputs["completion_mask"]
+
+        ref_per_token_logps = outputs["ref_per_token_logps"]
+        pixel_values = outputs["pixel_values"]
+        image_grid_thw = outputs["image_grid_thw"]
+
         self._metrics["avg_abs_advantage"].append(average_abs_advantage)
         self._metrics["provided_training_signal"].append(average_abs_advantage > 0)
 
