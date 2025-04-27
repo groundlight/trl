@@ -969,8 +969,23 @@ class QwenGRPOTrainer(Trainer):
         # Synchronize the initial input batch.
         # 'inputs' now refers to the synchronized, identical batch on all processes.
         inputs = self._sync_inputs_across_processes(process_input)
-
         outputs = self._process_batch_for_advantages(inputs)
+
+        # check if we need to oversample
+        oversampling_attempts = 0
+        while not outputs["average_abs_advantage"] > 0:
+            print(f"Attempting oversampling, attempt {oversampling_attempts}")
+            # get an example from the oversampler to try.
+            process_input = self._get_next_oversampling_batch() if self.accelerator.is_main_process else None
+            inputs = self._sync_inputs_across_processes(process_input)
+            outputs = self._process_batch_for_advantages(inputs)
+            print(
+                f"Finished with oversampling, attempt {oversampling_attempts}, the average abs advantage is {outputs['average_abs_advantage']}"
+            )
+            oversampling_attempts += 1
+
+        self._metrics["oversampling_attempts"].append(oversampling_attempts)
+        print(f"Oversampling attempts: {oversampling_attempts}")
 
         # unpack outputs
         average_abs_advantage = outputs["average_abs_advantage"]
