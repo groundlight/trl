@@ -1067,7 +1067,12 @@ class QwenGRPOTrainer(Trainer):
             # if the average absolute advantage is greater than 0, we add that example to the buffer with the average advantage
             average_abs_advantage = torch.abs(advantages).mean().item()
             self._metrics["avg_abs_advantage"].append(average_abs_advantage)
-            if average_abs_advantage > 0:
+
+            # record if the given example provided training signal. This is true if the average absolute advantage is greater than 0
+            provided_training_signal = average_abs_advantage > 0
+            self._metrics["provided_training_signal"].append(provided_training_signal)
+
+            if provided_training_signal:
                 print(f"Adding {inputs[0]} to the SSR buffer with advantage {average_abs_advantage}")
 
                 # add the example to the buffer with the average advantage
