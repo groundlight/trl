@@ -950,6 +950,7 @@ class QwenGRPOTrainer(Trainer):
             "prompt_mask": prompt_mask,
             "completions_text": completions_text,
             "completion_ids": completion_ids,
+            "completion_messages": completion_messages,
             "completion_mask": completion_mask,
             "ref_per_token_logps": ref_per_token_logps,
             "pixel_values": pixel_values,
@@ -973,7 +974,8 @@ class QwenGRPOTrainer(Trainer):
 
         # check if we need to oversample
         oversampling_attempts = 0
-        while not outputs["average_abs_advantage"] > 0:
+        print(f"Observed reward std: {outputs['std_grouped_rewards'][0].item()} on {self.accelerator.process_index}")
+        while not outputs["std_grouped_rewards"][0].item() > 0:
             print(f"Attempting oversampling, attempt {oversampling_attempts}")
             # get an example from the oversampler to try.
             process_input = self._get_next_oversampling_batch() if self.accelerator.is_main_process else None
@@ -986,6 +988,22 @@ class QwenGRPOTrainer(Trainer):
 
         self._metrics["oversampling_attempts"].append(oversampling_attempts)
         print(f"Oversampling attempts: {oversampling_attempts}")
+
+        gathered_conversations = gather_object(outputs["conversations"])
+        gathered_completions_text = gather_object(outputs["completions_text"])
+        gathered_completion_messages = gather_object(outputs["completion_messages"])
+
+        # callback for env specific metrics
+        if self.accelerator.is_main_process:
+            # returns a dict of key value pairs to log
+            metrics = self.env.log_metrics(
+                conversations=gathered_conversations,
+                completions_text=gathered_completions_text,
+                completion_messages=gathered_completion_messages,
+            )
+            for k, v in metrics.items():
+                self._metrics[k].append(v)
+        self.accelerator.wait_for_everyone()
 
         # unpack outputs
         average_abs_advantage = outputs["average_abs_advantage"]
