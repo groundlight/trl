@@ -863,7 +863,6 @@ class QwenGRPOTrainer(Trainer):
         else:
             completions = completions_text
 
-        rewards_per_func = torch.zeros(len(conversations), len(self.reward_funcs), device=device)
         rewards_per_func_gathered = None
 
         for i, (reward_func, reward_processing_class) in enumerate(
@@ -872,17 +871,6 @@ class QwenGRPOTrainer(Trainer):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 raise NotImplementedError("Models as reward functions are not supported yet.")
             else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                reward_kwargs["prompts_text"] = prompts_text
-                reward_kwargs["completions_messages"] = completion_messages
-                output_reward_func = reward_func(
-                    prompts=conversations, completions=completions, **deepcopy(reward_kwargs)
-                )
-
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
                 gathered_conversations = gather_object(conversations)
                 gathered_completions = gather_object(completions)
                 gathered_prompts_text = gather_object(prompts_text)
@@ -895,6 +883,7 @@ class QwenGRPOTrainer(Trainer):
 
                 if self.accelerator.is_main_process:
                     example = inputs[0]
+                    keys = [key for key in example if key not in ["prompt", "completion"]]
                     reward_kwargs = {key: [example[key] for _ in range(len(gathered_conversations))] for key in keys}
                     reward_kwargs["prompts_text"] = gathered_prompts_text
                     reward_kwargs["completions_messages"] = gathered_completion_messages
@@ -915,18 +904,12 @@ class QwenGRPOTrainer(Trainer):
             from_process=0,
         )
 
-        print(f"On device {device}, {rewards_per_func_gathered_distributed=}")
-        print(f"On device {device}, {rewards_per_func=}")
+        # select the relevant slice for the current process
         slice_start = self.accelerator.process_index * self.per_device_train_batch_size
         slice_end = slice_start + self.per_device_train_batch_size
         rewards_per_func_gathered_slice = rewards_per_func_gathered_distributed[slice_start:slice_end]
 
-        # this slice should be the same as the data we collected from the non-gathered approach
-        print(
-            f"On device {device}, {rewards_per_func_gathered_slice=}, {rewards_per_func=}. Sameness: {torch.equal(rewards_per_func_gathered_slice, rewards_per_func)}"
-        )
-
-        # replace the rewards_per_func with the gathered slice
+        # rename variable for downstream use
         rewards_per_func = rewards_per_func_gathered_slice
 
         print("Finished with rewards per function")
