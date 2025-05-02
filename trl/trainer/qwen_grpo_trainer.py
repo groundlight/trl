@@ -22,7 +22,7 @@ from unittest.mock import patch
 import torch
 import torch.utils.data
 import transformers
-from accelerate.utils import broadcast_object_list, gather, gather_object, set_seed
+from accelerate.utils import broadcast, broadcast_object_list, gather, gather_object, set_seed
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
@@ -42,7 +42,7 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
-from ..data_utils import apply_chat_template, is_conversational
+from ..data_utils import is_conversational
 from ..environment.env_protocol import Environment
 from ..import_utils import is_vllm_available
 from ..models import (
@@ -376,6 +376,9 @@ class QwenGRPOTrainer(Trainer):
 
         # we need this line to avoid serializing the reward weights on checkpoint save. The reward schedules are not serializable.
         self.args.reward_weights = None
+
+        # we need this to know how many completions per process we have for slicing the gathered rewards
+        self.per_device_train_batch_size = args.per_device_train_batch_size
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
@@ -861,34 +864,70 @@ class QwenGRPOTrainer(Trainer):
             completions = completions_text
 
         rewards_per_func = torch.zeros(len(conversations), len(self.reward_funcs), device=device)
+        rewards_per_func_gathered = None
+
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 raise NotImplementedError("Models as reward functions are not supported yet.")
-                if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(conversations, completions)]
-                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                else:
-                    texts = [p + c for p, c in zip(conversations, completions)]
-                reward_inputs = reward_processing_class(
-                    texts,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="right",
-                    add_special_tokens=False,
-                )
-                reward_inputs = super()._prepare_inputs(reward_inputs)
-                with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 reward_kwargs["prompts_text"] = prompts_text
                 reward_kwargs["completions_messages"] = completion_messages
-                output_reward_func = reward_func(prompts=conversations, completions=completions, **reward_kwargs)
+                output_reward_func = reward_func(
+                    prompts=conversations, completions=completions, **deepcopy(reward_kwargs)
+                )
+
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+                gathered_conversations = gather_object(conversations)
+                gathered_completions = gather_object(completions)
+                gathered_prompts_text = gather_object(prompts_text)
+                gathered_completion_messages = gather_object(completion_messages)
+
+                if rewards_per_func_gathered is None:
+                    rewards_per_func_gathered = torch.zeros(
+                        len(gathered_conversations), len(self.reward_funcs), device=device
+                    )
+
+                if self.accelerator.is_main_process:
+                    example = inputs[0]
+                    reward_kwargs = {key: [example[key] for _ in range(len(gathered_conversations))] for key in keys}
+                    reward_kwargs["prompts_text"] = gathered_prompts_text
+                    reward_kwargs["completions_messages"] = gathered_completion_messages
+                    output_reward_func_gathered = reward_func(
+                        prompts=gathered_conversations,
+                        completions=gathered_completions,
+                        **deepcopy(reward_kwargs),
+                    )
+                    rewards_per_func_gathered[:, i] = torch.tensor(
+                        output_reward_func_gathered, dtype=torch.float32, device=device
+                    )
+
+                self.accelerator.wait_for_everyone()
+
+        # distribute the reward_per_func_gathered to all processes (as we only did the update on the main process)
+        rewards_per_func_gathered_distributed = broadcast(
+            rewards_per_func_gathered,
+            from_process=0,
+        )
+
+        print(f"On device {device}, {rewards_per_func_gathered_distributed=}")
+        print(f"On device {device}, {rewards_per_func=}")
+        slice_start = self.accelerator.process_index * self.per_device_train_batch_size
+        slice_end = slice_start + self.per_device_train_batch_size
+        rewards_per_func_gathered_slice = rewards_per_func_gathered_distributed[slice_start:slice_end]
+
+        # this slice should be the same as the data we collected from the non-gathered approach
+        print(
+            f"On device {device}, {rewards_per_func_gathered_slice=}, {rewards_per_func=}. Sameness: {torch.equal(rewards_per_func_gathered_slice, rewards_per_func)}"
+        )
+
+        # replace the rewards_per_func with the gathered slice
+        rewards_per_func = rewards_per_func_gathered_slice
 
         print("Finished with rewards per function")
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
