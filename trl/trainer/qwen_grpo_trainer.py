@@ -995,9 +995,12 @@ class QwenGRPOTrainer(Trainer):
         outputs = self._process_batch_for_advantages(inputs)
 
         # check if we need to oversample
+        should_oversample = (
+            False  # turning off oversampling for now as it makes it harder to understand model performance
+        )
         oversampling_attempts = 0
         print(f"Observed reward std: {outputs['std_grouped_rewards'][0].item()} on {self.accelerator.process_index}")
-        while not outputs["std_grouped_rewards"][0].item() > 0:
+        while not outputs["std_grouped_rewards"][0].item() > 0 and should_oversample:
             print(f"Attempting oversampling, attempt {oversampling_attempts}")
             # get an example from the oversampler to try.
             process_input = self._get_next_oversampling_batch() if self.accelerator.is_main_process else None
