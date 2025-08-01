@@ -954,7 +954,11 @@ class QwenGRPOTrainer(Trainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        advantages = torch.where(
+            std_grouped_rewards == 0,
+            torch.zeros_like(rewards),
+            (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4),
+        )
 
         print("Finished with advantages")
 
@@ -1017,7 +1021,6 @@ class QwenGRPOTrainer(Trainer):
         gathered_conversations = gather_object(outputs["conversations"])
         gathered_completions_text = gather_object(outputs["completions_text"])
         gathered_completion_messages = gather_object(outputs["completion_messages"])
-
         # callback for env specific metrics
         if self.accelerator.is_main_process:
             # returns a dict of key value pairs to log
@@ -1025,6 +1028,8 @@ class QwenGRPOTrainer(Trainer):
                 conversations=gathered_conversations,
                 completions_text=gathered_completions_text,
                 completion_messages=gathered_completion_messages,
+                advantages=outputs["advantages"].to("cpu").tolist(),
+                global_step=self.state.global_step,
             )
             for k, v in metrics.items():
                 self._metrics[k].append(v)
