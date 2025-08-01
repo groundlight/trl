@@ -214,6 +214,17 @@ class GRPOConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "KL coefficient."},
     )
+
+    epsilon_low: float = field(
+        default=0.2,
+        metadata={"help": "Value to clip at 1-epsilon."},
+    )
+    epsilon_high: float = field(
+        default=0.28,
+        metadata={
+            "help": "Value to clip at 1+epsilon. Generally set this higher than epsilon_low based on DAPO paper results."
+        },
+    )
     reward_weights: Optional[list[float]] = field(
         default=None,
         metadata={
@@ -248,4 +259,12 @@ class GRPOConfig(TrainingArguments):
     log_completions: bool = field(
         default=False,
         metadata={"help": "Whether to log the completions during training."},
+    )
+    limit_image_per_prompt: int = field(
+        default=1,
+        metadata={"help": "Limit the number of images per prompt for vllm generation."},
+    )
+    limit_video_per_prompt: int = field(
+        default=0,
+        metadata={"help": "Limit the number of videos per prompt for vllm generation."},
     )
